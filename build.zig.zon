@@ -1,0 +1,15 @@
+.{
+    .name = .zigup,
+    .version = "0.2.1",
+    .fingerprint = 0x7cbb96d0081b7d22, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.1902+896bd9e15",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+        ".gitignore",
+    },
+}

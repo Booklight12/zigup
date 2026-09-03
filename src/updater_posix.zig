@@ -17,16 +17,14 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
+const proxy_mod = @import("proxy_posix.zig");
 
 const index_url = "https://ziglang.org/download/index.json";
 const official_url_prefix = "https://ziglang.org/";
 const profile_marker = "# >>> zigup managed PATH >>>";
 const legacy_profile_marker = "# Added by zigup so the managed zig/zig-dev shims are available.";
 
-const DownloadTool = struct {
-    kind: enum { curl, wget },
-    path: []const u8,
-};
+const DownloadTool = proxy_mod.DownloadTool;
 
 const Context = struct {
     allocator: Allocator,
@@ -37,6 +35,7 @@ const Context = struct {
     toolchains_dir: []const u8,
     platform_key: []const u8,
     download_tool: DownloadTool,
+    proxy_session: proxy_mod.Session,
 };
 
 const Installed = struct {
@@ -80,6 +79,7 @@ pub fn run(
         .toolchains_dir = toolchains_dir,
         .platform_key = try platformKey(allocator, builtin.cpu.arch, builtin.os.tag),
         .download_tool = undefined,
+        .proxy_session = try proxy_mod.Session.init(allocator, io, environ_map),
     };
     ctx.download_tool = (try findDownloadTool(&ctx)) orelse return error.DownloadToolMissing;
 
@@ -234,24 +234,7 @@ fn findDownloadTool(ctx: *Context) !?DownloadTool {
 }
 
 fn download(ctx: *Context, url: []const u8, output_path: []const u8) !void {
-    const argv: []const []const u8 = switch (ctx.download_tool.kind) {
-        .curl => &.{
-            ctx.download_tool.path, "--fail",       "--location", "--retry",   "3",
-            "--silent",             "--show-error", "--output",   output_path, url,
-        },
-        .wget => &.{
-            ctx.download_tool.path, "--tries=3", "--timeout=30", "--no-verbose",
-            "--output-document",    output_path, url,
-        },
-    };
-    var child = std.process.spawn(ctx.io, .{
-        .argv = argv,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch return error.DownloadFailed;
-    const term = child.wait(ctx.io) catch return error.DownloadFailed;
-    if (!term.success()) return error.DownloadFailed;
+    try ctx.proxy_session.download(ctx.download_tool, url, output_path);
 }
 
 fn extractArchive(io: Io, archive_path: []const u8, dest_dir: []const u8) !void {

@@ -4,3 +4,4 @@
 *.pdb
 *.obj
 *.exe
+/tests/__pycache__/

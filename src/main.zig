@@ -187,6 +187,11 @@ fn describeError(err: anyerror) []const u8 {
         error.InvalidSha256InIndex => "invalid SHA-256 in the Zig download index",
         error.Sha256Mismatch => "SHA-256 mismatch for the downloaded archive",
         error.DownloadFailed => "download failed; check network connectivity",
+        error.InvalidProxy => "invalid proxy configuration; set ZIGUP_PROXY to auto, direct, or a proxy URL",
+        error.ProxyUnsupportedByDownloadTool => "this proxy protocol requires curl; wget supports HTTP proxies only",
+        error.DownloadLocalFailure => "the downloader could not read or write a local file",
+        error.DownloadInterrupted => "download interrupted",
+        error.InvalidDownloadUrl => "invalid download URL",
         error.DownloadToolMissing => "neither curl nor wget is available for downloading",
         error.TarFailed => "extraction failed; ensure tar supports xz archives",
         error.ExtractedVersionMismatch => "the extracted archive does not contain the expected Zig version",
@@ -218,6 +223,8 @@ fn printUsage(writer: *Io.Writer) !void {
         \\  zigup version
         \\
         \\`remove` only deletes registration metadata, never the Zig installation.
+        \\Downloads automatically select environment/system proxies, then direct.
+        \\ZIGUP_PROXY=direct disables proxies; ZIGUP_PROXY=<URL> forces one proxy.
         \\
     );
 }

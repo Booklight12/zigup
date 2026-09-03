@@ -12,6 +12,11 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version 2.0
 
+# ZIGUP_PROXY_IMPLEMENTATION
+if ($null -eq (Get-Command Invoke-ZigupDownload -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'windows_proxy.ps1')
+}
+
 function Write-Status([string]$Message) {
     Write-Host "zigup: $Message"
 }
@@ -265,7 +270,7 @@ function Install-Release(
     $expectedHash = [string]$asset.shasum
 
     if (-not $url.StartsWith('https://ziglang.org/', [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "refusing a non-official Zig download URL: $url"
+        throw 'refusing a non-official Zig download URL'
     }
     if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') {
         throw "invalid SHA-256 in Zig download index for $version"
@@ -281,19 +286,8 @@ function Install-Release(
     $archiveName = "zig-$Channel-$version.zip"
     $archive = Join-Path $DownloadsDir $archiveName
     if (-not (Test-ArchiveHash $archive $expectedHash)) {
-        if (Test-Path -LiteralPath $archive) {
-            Remove-Item -LiteralPath $archive -Force
-        }
-        $partial = "$archive.partial"
-        if (Test-Path -LiteralPath $partial) {
-            Remove-Item -LiteralPath $partial -Force
-        }
         Write-Status "downloading $Channel $version"
-        & (Get-SystemTool 'curl.exe') --fail --location --retry 3 --silent --show-error --output $partial $url
-        if ($LASTEXITCODE -ne 0) {
-            throw "curl failed while downloading $url (exit $LASTEXITCODE)"
-        }
-        Move-Item -LiteralPath $partial -Destination $archive -Force
+        Invoke-ZigupDownload -Url $url -Destination $archive -ExpectedHash $expectedHash
     }
 
     Write-Status "verifying $Channel $version SHA-256"
@@ -494,8 +488,19 @@ try {
 $originalZigCommand = Get-Command zig.exe -ErrorAction SilentlyContinue
 $originalZigExe = if ($null -ne $originalZigCommand) { $originalZigCommand.Source } else { '' }
 
-Write-Status "reading official release index $IndexUrl"
-$index = Invoke-RestMethod -Uri $IndexUrl -UseBasicParsing
+Write-Status 'reading official release index'
+$indexFile = Join-Path $downloadsDir "index-$([guid]::NewGuid().ToString('N')).json"
+try {
+    Invoke-ZigupDownload -Url $IndexUrl -Destination $indexFile -Validator {
+        param($Path)
+        $candidate = [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+        return $null -ne $candidate.PSObject.Properties['master']
+    }
+    $index = [IO.File]::ReadAllText($indexFile) | ConvertFrom-Json
+}
+finally {
+    if ([IO.File]::Exists($indexFile)) { [IO.File]::Delete($indexFile) }
+}
 $platformKey = Get-PlatformKey
 $stableProperty = Get-LatestStableProperty $index
 $stableRelease = $stableProperty.Value

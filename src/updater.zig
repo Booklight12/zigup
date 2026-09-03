@@ -5,7 +5,15 @@ const Io = std.Io;
 const Store = @import("store.zig").Store;
 const posix_updater = @import("updater_posix.zig");
 
-const windows_update_script = @embedFile("windows_update.ps1");
+const windows_update_template = @embedFile("windows_update.ps1");
+const windows_proxy_script = @embedFile("windows_proxy.ps1");
+const windows_proxy_marker = "# ZIGUP_PROXY_IMPLEMENTATION";
+const windows_update_script = blk: {
+    const position = std.mem.indexOf(u8, windows_update_template, windows_proxy_marker) orelse
+        @compileError("Windows updater is missing its proxy implementation marker");
+    break :blk windows_update_template[0..position] ++ windows_proxy_script ++
+        windows_update_template[position + windows_proxy_marker.len ..];
+};
 
 /// Updates both toolchain channels using the implementation specialized for
 /// the host operating system.
@@ -83,4 +91,10 @@ test "embedded Windows updater provisions stable and dev commands" {
     try std.testing.expect(std.mem.indexOf(u8, windows_update_script, "Test-DedicatedZigDirectory") != null);
     try std.testing.expect(std.mem.indexOf(u8, windows_update_script, "Test-PathContainsDirectory") != null);
     try std.testing.expect(std.mem.indexOf(u8, windows_update_script, "store.lock") != null);
+}
+
+test "Windows updater embeds the proxy implementation without a runtime sidecar" {
+    try std.testing.expect(std.mem.indexOf(u8, windows_update_script, windows_proxy_marker) == null);
+    try std.testing.expect(std.mem.indexOf(u8, windows_update_script, "function Invoke-ZigupDownload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, windows_update_script, "ZIGUP_PROXY") != null);
 }

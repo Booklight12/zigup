@@ -67,6 +67,14 @@ pub fn build(b: *std.Build) void {
         });
         windows_proxy_tests.addFileArg(b.path("tests/windows_proxy.Tests.ps1"));
         test_step.dependOn(&windows_proxy_tests.step);
+
+        const windows_remove_tests = b.addSystemCommand(&.{
+            "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+        });
+        windows_remove_tests.addFileArg(b.path("tests/windows_remove.Tests.ps1"));
+        windows_remove_tests.addArg("-ZigupExe");
+        windows_remove_tests.addArtifactArg(executable);
+        test_step.dependOn(&windows_remove_tests.step);
     }
 
     // Optional test tooling is not part of the installed zigup distribution.

@@ -4,7 +4,7 @@ const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const updater = @import("updater.zig");
 
-const app_version = "0.2.1";
+const app_version = "0.2.2";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -36,7 +36,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const command = args[1];
-    if (commandArity(command)) |expected| {
+    if (std.mem.eql(u8, command, "remove")) {
+        _ = parseRemoveArgs(args) catch return fail(stdout, stderr, error.InvalidArguments);
+    } else if (commandArity(command)) |expected| {
         requireArity(args, expected) catch return fail(stdout, stderr, error.InvalidArguments);
     } else {
         try stderr.print("unknown command: {s}\n\n", .{command});
@@ -92,9 +94,19 @@ pub fn main(init: std.process.Init) !void {
         requireArity(args, 2) catch return fail(stdout, stderr, error.InvalidArguments);
         listVersions(store, stdout) catch |err| return fail(stdout, stderr, err);
     } else if (std.mem.eql(u8, command, "remove")) {
-        requireArity(args, 3) catch return fail(stdout, stderr, error.InvalidArguments);
-        store.remove(args[2]) catch |err| return fail(stdout, stderr, err);
-        try stdout.print("removed registration for {s}\n", .{args[2]});
+        const remove_args = parseRemoveArgs(args) catch return fail(stdout, stderr, error.InvalidArguments);
+        const result = store.remove(remove_args.version, .{ .force = remove_args.force }) catch |err| {
+            const incomplete = store.isIncomplete(remove_args.version) catch false;
+            if (incomplete) return failRemoval(stdout, stderr, err);
+            return fail(stdout, stderr, err);
+        };
+        try stdout.print("removed registration for {s}\n", .{remove_args.version});
+        if (result.terminated_processes != 0) {
+            try stdout.print("force-stopped {d} toolchain process(es)\n", .{result.terminated_processes});
+        }
+        if (result.deleted_managed_toolchain) try stdout.writeAll("deleted managed toolchain files\n");
+        if (result.cleared_stable) try stdout.writeAll("cleared stable selection and shim\n");
+        if (result.cleared_dev) try stdout.writeAll("cleared dev selection and shim\n");
     } else unreachable;
 }
 
@@ -122,7 +134,8 @@ fn listVersions(store: Store, writer: *Io.Writer) !void {
         const is_active = (active != null and store_mod.versionEqual(active.?, version)) or
             (active_dev != null and store_mod.versionEqual(active_dev.?, version));
         const marker = if (is_active) "*" else " ";
-        try writer.print("{s} {s}\n", .{ marker, version });
+        const incomplete = if (try store.isIncomplete(version)) " Incomplete" else "";
+        try writer.print("{s} {s}{s}\n", .{ marker, version, incomplete });
     }
     if (versions.items.len == 0) try writer.writeAll("no registered Zig versions\n");
 }
@@ -148,10 +161,26 @@ fn commandArity(command: []const u8) ?usize {
         std.mem.eql(u8, command, "current") or
         std.mem.eql(u8, command, "list")) return 2;
     if (std.mem.eql(u8, command, "use") or
-        std.mem.eql(u8, command, "where") or
-        std.mem.eql(u8, command, "remove")) return 3;
+        std.mem.eql(u8, command, "where")) return 3;
     if (std.mem.eql(u8, command, "add")) return 4;
     return null;
+}
+
+const RemoveArgs = struct {
+    version: []const u8,
+    force: bool,
+};
+
+fn parseRemoveArgs(args: []const []const u8) !RemoveArgs {
+    if (args.len == 3) return .{ .version = args[2], .force = false };
+    if (args.len == 4 and
+        (std.mem.eql(u8, args[2], "-force") or
+            std.mem.eql(u8, args[2], "--force") or
+            std.mem.eql(u8, args[2], "-f")))
+    {
+        return .{ .version = args[3], .force = true };
+    }
+    return error.InvalidArguments;
 }
 
 fn fail(stdout: *Io.Writer, stderr: *Io.Writer, err: anyerror) noreturn {
@@ -162,12 +191,23 @@ fn fail(stdout: *Io.Writer, stderr: *Io.Writer, err: anyerror) noreturn {
     std.process.exit(1);
 }
 
+fn failRemoval(stdout: *Io.Writer, stderr: *Io.Writer, err: anyerror) noreturn {
+    stdout.flush() catch {};
+    stderr.writeAll("zigup: version was not removed Incomplete\n") catch {};
+    stderr.print("reason: {s}\n", .{describeError(err)}) catch {};
+    stderr.print("details: {s}\n", .{@errorName(err)}) catch {};
+    stderr.flush() catch {};
+    std.process.exit(1);
+}
+
 fn describeError(err: anyerror) []const u8 {
     return switch (err) {
         error.InvalidArguments => "invalid command arguments; run `zigup help`",
         error.InvalidVersion => "invalid version name",
         error.VersionNotFound => "version is not registered",
-        error.VersionIsActive => "cannot remove the active version; select another version first",
+        error.ToolchainInUse => "toolchain is in use; stop running Zig processes and retry",
+        error.ToolchainForceStopFailed => "could not stop every process using the toolchain",
+        error.ToolchainProcessInspectionFailed => "could not inspect running processes for toolchain locks",
         error.InvalidRegistration => "registration metadata is invalid",
         error.NotAFile => "the Zig executable path is not a file",
         error.NotExecutable => "the Zig executable path is not executable",
@@ -217,12 +257,14 @@ fn printUsage(writer: *Io.Writer) !void {
         \\  zigup update
         \\  zigup current
         \\  zigup where <version>
-        \\  zigup remove <version>
+        \\  zigup remove [-force] <version>
         \\  zigup home
         \\  zigup env
         \\  zigup version
         \\
-        \\`remove` only deletes registration metadata, never the Zig installation.
+        \\`remove` checks for running toolchain processes before deletion. Failures
+        \\are retained as Incomplete; `remove -force` stops those processes first.
+        \\Managed toolchains are deleted; external installations are unregistered.
         \\Downloads automatically select environment/system proxies, then direct.
         \\ZIGUP_PROXY=direct disables proxies; ZIGUP_PROXY=<URL> forces one proxy.
         \\
@@ -234,6 +276,22 @@ test "command arities reject unknown commands" {
     try std.testing.expectEqual(@as(?usize, 3), commandArity("use"));
     try std.testing.expectEqual(@as(?usize, 4), commandArity("add"));
     try std.testing.expectEqual(@as(?usize, null), commandArity("unknown"));
+}
+
+test "remove accepts explicit force spellings only before the version" {
+    const plain = [_][]const u8{ "zigup", "remove", "1.2.3" };
+    const force = [_][]const u8{ "zigup", "remove", "-force", "1.2.3" };
+    const long_force = [_][]const u8{ "zigup", "remove", "--force", "1.2.3" };
+    const short_force = [_][]const u8{ "zigup", "remove", "-f", "1.2.3" };
+    const misplaced = [_][]const u8{ "zigup", "remove", "1.2.3", "-force" };
+    const unknown = [_][]const u8{ "zigup", "remove", "-delete", "1.2.3" };
+
+    try std.testing.expect(!(try parseRemoveArgs(&plain)).force);
+    try std.testing.expect((try parseRemoveArgs(&force)).force);
+    try std.testing.expect((try parseRemoveArgs(&long_force)).force);
+    try std.testing.expect((try parseRemoveArgs(&short_force)).force);
+    try std.testing.expectError(error.InvalidArguments, parseRemoveArgs(&misplaced));
+    try std.testing.expectError(error.InvalidArguments, parseRemoveArgs(&unknown));
 }
 
 test "version labels sort deterministically" {

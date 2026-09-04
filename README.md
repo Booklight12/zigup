@@ -64,9 +64,15 @@ that entry manually; zigup will not move or replace a shared directory.
 - `zigup use <version>` selects a version and regenerates the shim.
 - `zigup current` displays the selected version and executable.
 - `zigup where <version>` displays a registered executable path.
-- `zigup remove <version>` removes registration metadata. It never deletes the
-  Zig installation itself, and refuses to remove a version that is currently
-  selected for either channel.
+- `zigup remove <version>` first checks whether the selected toolchain has
+  running processes. An in-use toolchain is left untouched and the version is
+  shown by `zigup list` with `Incompelte`. Other removal failures retain the same
+  marker and registration for a later retry. `zigup remove -force <version>`
+  terminates only processes running that exact toolchain executable and their
+  descendants before retrying deletion. Managed toolchains under the zigup
+  data directory are deleted; externally managed installations are only
+  unregistered. Removing an active version also clears its channel selection
+  and command shim after its managed files have been deleted successfully.
 - `zigup home` displays the data directory.
 - `zigup env` displays the shim directory to add to `PATH`.
 
@@ -212,5 +218,6 @@ zigup/
 |-- downloads/
 |-- toolchains/
 `-- versions/
-    `-- <version>.path
+    |-- <version>.path
+    `-- <version>.incomplete  (present only after an incomplete removal)
 ```

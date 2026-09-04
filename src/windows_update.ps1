@@ -521,6 +521,8 @@ $storeLock = Open-ExclusiveFileLock (Join-Path $ZigupHome 'store.lock')
 try {
     Write-Utf8NoBom (Join-Path $versionsDir "$($stableRelease.version).path") $stableExe
     Write-Utf8NoBom (Join-Path $versionsDir "$($devRelease.version).path") $devExe
+    [IO.File]::Delete((Join-Path $versionsDir "$($stableRelease.version).incomplete"))
+    [IO.File]::Delete((Join-Path $versionsDir "$($devRelease.version).incomplete"))
     Write-Utf8NoBom (Join-Path $ZigupHome 'current') ([string]$stableRelease.version)
     Write-Utf8NoBom (Join-Path $ZigupHome 'current-dev') ([string]$devRelease.version)
     Write-CmdShim (Join-Path $binDir 'zig.cmd') $stableExe

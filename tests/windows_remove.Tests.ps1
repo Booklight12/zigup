@@ -35,6 +35,8 @@ $hadHome = Test-Path Env:ZIGUP_HOME
 $oldHome = $env:ZIGUP_HOME
 $targetProcess = $null
 $unrelatedProcess = $null
+$fileOwner = $null
+$heldFile = $null
 try {
     $env:ZIGUP_HOME = $testRoot
     $version = '1.2.3-force-test'
@@ -59,7 +61,7 @@ try {
 
     $result = Invoke-Zigup @('remove', $version)
     Assert-True ($result.Code -ne 0) 'normal remove refuses an in-use toolchain'
-    Assert-True ($result.Output.Contains('【不完整】')) 'refused removal is explicitly incomplete'
+    Assert-True ($result.Output.Contains('[Incomplete]')) "refused removal is explicitly incomplete: $($result.Output)"
     Assert-True ($result.Output.Contains('ToolchainInUse')) 'refused removal reports lock reason'
     $targetProcess.Refresh()
     Assert-True (-not $targetProcess.HasExited) 'normal remove does not stop the target process'
@@ -70,10 +72,10 @@ try {
     Assert-True ([IO.File]::Exists((Join-Path $testRoot 'current'))) 'normal remove preserves active selection'
     Assert-True ([IO.File]::Exists((Join-Path $testRoot 'bin\zig.cmd'))) 'normal remove preserves active shim'
     $list = Invoke-Zigup @('list')
-    Assert-True ($list.Code -eq 0 -and $list.Output.Contains("$version 【不完整】")) 'list displays incomplete version'
+    Assert-True ($list.Code -eq 0 -and $list.Output.Contains("$version [Incomplete]")) 'list displays incomplete version'
 
     $result = Invoke-Zigup @('remove', '-force', $version)
-    Assert-True ($result.Code -eq 0) 'force remove succeeds'
+    Assert-True ($result.Code -eq 0) "force remove succeeds: $($result.Output)"
     Assert-True ($result.Output.Contains('force-stopped')) 'force remove reports terminated processes'
     $targetProcess.Refresh()
     $unrelatedProcess.Refresh()
@@ -84,9 +86,67 @@ try {
     Assert-True (-not [IO.File]::Exists((Join-Path $testRoot "versions\$version.incomplete"))) 'force remove clears incomplete marker'
     Assert-True (-not [IO.File]::Exists((Join-Path $testRoot 'current'))) 'force remove clears active selection'
     Assert-True (-not [IO.File]::Exists((Join-Path $testRoot 'bin\zig.cmd'))) 'force remove clears active shim'
+
+    # A process with a different image locks a library file. Probe every file
+    # before deletion and use Restart Manager to release the actual owner.
+    $version = '2.0.0-file-lock'
+    $toolchain = Join-Path $testRoot "toolchains\$version"
+    [IO.Directory]::CreateDirectory((Join-Path $toolchain 'lib')) | Out-Null
+    $testZig = Join-Path $toolchain 'zig.exe'
+    [IO.File]::Copy($systemPing, $testZig, $false)
+    $lockedFile = Join-Path $toolchain 'lib\std.zig'
+    [IO.File]::WriteAllText($lockedFile, 'locked library')
+    Assert-True ((Invoke-Zigup @('add', $version, $testZig)).Code -eq 0) 'register library-lock fixture'
+    $ready = Join-Path $testRoot 'owner-ready'
+    $fixture = Join-Path $PSScriptRoot 'windows_lock_fixture.ps1'
+    $fileOwner = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$fixture`"", '-LockPath', "`"$lockedFile`"", '-ReadyPath', "`"$ready`"") -WindowStyle Hidden -PassThru
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not [IO.File]::Exists($ready) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+    Assert-True ([IO.File]::Exists($ready)) 'library-lock owner is ready'
+    $result = Invoke-Zigup @('remove', $version)
+    Assert-True ($result.Code -ne 0 -and $result.Output.Contains('ToolchainInUse')) 'library lock stops ordinary removal'
+    Assert-True ([IO.File]::Exists($testZig) -and [IO.File]::Exists($lockedFile)) 'library lock check happens before deleting executable'
+    $result = Invoke-Zigup @('remove', '-force', $version)
+    Assert-True ($result.Code -eq 0) "force releases library lock: $($result.Output)"
+    $fileOwner.Refresh()
+    Assert-True ($fileOwner.HasExited -and -not [IO.Directory]::Exists($toolchain)) 'force terminates file owner and completes deletion'
+    $unrelatedProcess.Refresh()
+    Assert-True (-not $unrelatedProcess.HasExited) 'file-lock force preserves unrelated process'
+
+    # Failure after the managed files were deleted must retain the registration
+    # and marker, report failure, and allow retry even though zig.exe is gone.
+    $version = '3.0.0-late-failure'
+    $toolchain = Join-Path $testRoot "toolchains\$version"
+    [IO.Directory]::CreateDirectory($toolchain) | Out-Null
+    $testZig = Join-Path $toolchain 'zig.exe'
+    [IO.File]::Copy($systemPing, $testZig, $false)
+    Assert-True ((Invoke-Zigup @('add', $version, $testZig)).Code -eq 0) 'register late failure fixture'
+    $registration = Join-Path $testRoot "versions\$version.path"
+    $heldFile = [IO.File]::Open($registration, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $result = Invoke-Zigup @('remove', $version)
+    Assert-True ($result.Code -ne 0 -and $result.Output.Contains('[Incomplete]')) 'late failure is never reported as success'
+    Assert-True (-not [IO.Directory]::Exists($toolchain)) 'late failure occurs after toolchain deletion'
+    Assert-True ([IO.File]::Exists($registration)) 'late failure retains registration'
+    Assert-True ((Invoke-Zigup @('list')).Output.Contains("$version [Incomplete]")) 'late failure remains visible in list'
+    $heldFile.Dispose(); $heldFile = $null
+    Assert-True ((Invoke-Zigup @('remove', $version)).Code -eq 0) 'late failure retry succeeds without executable'
+    Assert-True (-not [IO.File]::Exists($registration)) 'retry removes registration'
+
+    # Store/update mutexes are nonblocking, including in force mode.
+    foreach ($lockName in @('store.lock', 'update.lock')) {
+        $heldFile = [IO.File]::Open((Join-Path $testRoot $lockName), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+        $heldFile.Lock(0, 1)
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $result = Invoke-Zigup @('remove', '-force', 'no-such-version')
+        $watch.Stop()
+        Assert-True ($result.Code -ne 0 -and $result.Output.Contains('RemovalAlreadyRunning')) "$lockName conflict is reported"
+        Assert-True ($watch.Elapsed.TotalSeconds -lt 5) "$lockName conflict returns immediately"
+        $heldFile.Dispose(); $heldFile = $null
+    }
 }
 finally {
-    foreach ($process in @($targetProcess, $unrelatedProcess)) {
+    if ($null -ne $heldFile) { $heldFile.Dispose() }
+    foreach ($process in @($targetProcess, $unrelatedProcess, $fileOwner)) {
         if ($null -eq $process) { continue }
         try {
             $process.Refresh()

@@ -25,6 +25,7 @@ const ProcessInfo = struct {
     process_id: windows.DWORD,
     parent_process_id: windows.DWORD,
     target: bool,
+    started: u64,
     selected: bool = false,
 };
 
@@ -52,7 +53,7 @@ pub fn ensureIdle(allocator: Allocator, executable: []const u8, force: bool) !Re
         if (pass == 0) result.matched = matched;
 
         selectDescendants(processes.items);
-        result.terminated += terminateSelected(processes.items);
+        result.terminated += try terminateSelected(processes.items);
     }
     return error.ToolchainForceStopFailed;
 }
@@ -70,29 +71,43 @@ fn snapshot(allocator: Allocator, executable: []const u8) !std.ArrayList(Process
     if (!available) return error.ToolchainProcessInspectionFailed;
 
     while (available) {
-        const is_target = try processPathMatches(allocator, entry.process_id, executable);
+        const identity = try processIdentity(allocator, entry.process_id, executable);
         try result.append(allocator, .{
             .process_id = entry.process_id,
             .parent_process_id = entry.parent_process_id,
-            .target = is_target,
+            .target = identity.target,
+            .started = identity.started,
         });
         entry.size = @sizeOf(ProcessEntry);
         available = Process32NextW(handle, &entry).toBool();
     }
+    if (@backingInt(windows.GetLastError()) != 18) return error.ToolchainProcessInspectionFailed;
     return result;
 }
 
-fn processPathMatches(allocator: Allocator, process_id: windows.DWORD, executable: []const u8) !bool {
-    if (process_id == windows.GetCurrentProcessId()) return false;
-    const handle = OpenProcess(process_query_limited_information, .FALSE, process_id) orelse return false;
+const Identity = struct { target: bool = false, started: u64 = 0 };
+const Time = extern struct { low: u32, high: u32 };
+
+fn creationTime(handle: windows.HANDLE) !u64 {
+    var start: Time = undefined;
+    var end: Time = undefined;
+    var kernel: Time = undefined;
+    var user: Time = undefined;
+    if (!GetProcessTimes(handle, &start, &end, &kernel, &user).toBool()) return error.ToolchainProcessInspectionFailed;
+    return (@as(u64, start.high) << 32) | start.low;
+}
+
+fn processIdentity(allocator: Allocator, process_id: windows.DWORD, executable: []const u8) !Identity {
+    if (process_id == windows.GetCurrentProcessId()) return .{};
+    const handle = OpenProcess(process_query_limited_information, .FALSE, process_id) orelse return .{};
     defer windows.CloseHandle(handle);
 
     var path_w: [32768:0]u16 = undefined;
     var path_len: windows.DWORD = path_w.len;
-    if (!QueryFullProcessImageNameW(handle, 0, &path_w, &path_len).toBool()) return false;
+    if (!QueryFullProcessImageNameW(handle, 0, &path_w, &path_len).toBool()) return .{};
     const path = try std.unicode.wtf16LeToWtf8Alloc(allocator, path_w[0..path_len]);
     defer allocator.free(path);
-    return std.ascii.eqlIgnoreCase(path, executable);
+    return .{ .target = std.ascii.eqlIgnoreCase(path, executable), .started = try creationTime(handle) };
 }
 
 fn selectDescendants(processes: []ProcessInfo) void {
@@ -103,7 +118,9 @@ fn selectDescendants(processes: []ProcessInfo) void {
         for (processes) |*candidate| {
             if (candidate.selected) continue;
             for (processes) |parent| {
-                if (parent.selected and candidate.parent_process_id == parent.process_id) {
+                if (parent.selected and candidate.parent_process_id == parent.process_id and
+                    candidate.started != 0 and candidate.started >= parent.started)
+                {
                     candidate.selected = true;
                     changed = true;
                     break;
@@ -113,27 +130,34 @@ fn selectDescendants(processes: []ProcessInfo) void {
     }
 }
 
-fn terminateSelected(processes: []const ProcessInfo) usize {
+fn terminateSelected(processes: []const ProcessInfo) !usize {
     var terminated: usize = 0;
     // Stop roots first so persistent build/watch processes cannot spawn more
     // children while the rest of their process tree is being terminated.
     for (processes) |process| {
         if (!process.target) continue;
-        if (terminate(process.process_id)) terminated += 1;
+        if (try terminate(process)) terminated += 1;
     }
     for (processes) |process| {
         if (!process.selected or process.target) continue;
-        if (terminate(process.process_id)) terminated += 1;
+        if (try terminate(process)) terminated += 1;
     }
     return terminated;
 }
 
-fn terminate(process_id: windows.DWORD) bool {
-    const handle = OpenProcess(process_terminate | synchronize, .FALSE, process_id) orelse return false;
+fn terminate(process: ProcessInfo) !bool {
+    const handle = OpenProcess(process_query_limited_information | process_terminate | synchronize, .FALSE, process.process_id) orelse {
+        if (@backingInt(windows.GetLastError()) == 87) return false;
+        return error.ToolchainForceStopFailed;
+    };
     defer windows.CloseHandle(handle);
-    if (!TerminateProcess(handle, 1).toBool()) return false;
-    return WaitForSingleObject(handle, 5000) == 0;
+    if (try creationTime(handle) != process.started) return false;
+    if (WaitForSingleObject(handle, 0) == 0) return false;
+    if (!TerminateProcess(handle, 1).toBool() or WaitForSingleObject(handle, 5000) != 0) return error.ToolchainForceStopFailed;
+    return true;
 }
+
+extern "kernel32" fn GetProcessTimes(windows.HANDLE, *Time, *Time, *Time, *Time) callconv(.winapi) windows.BOOL;
 
 extern "kernel32" fn CreateToolhelp32Snapshot(
     flags: windows.DWORD,

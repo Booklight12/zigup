@@ -138,12 +138,18 @@ pub const Store = struct {
     pub fn remove(self: Store, version: []const u8, options: RemoveOptions) !RemoveResult {
         if (!isValidVersion(version)) return error.InvalidVersion;
         try self.ensure();
-        var mutation_lock = try self.acquireMutationLock();
+        var update_lock = try self.acquireRemovalLock("update.lock");
+        defer update_lock.close(self.io);
+        var mutation_lock = try self.acquireRemovalLock("store.lock");
         defer mutation_lock.close(self.io);
 
-        const executable = try self.readRegistration(version);
         const registration = try self.registrationPath(version);
+        _ = Io.Dir.cwd().statFile(self.io, registration, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return error.VersionNotFound,
+            else => return err,
+        };
         try self.markIncomplete(version);
+        const executable = try self.readRegistration(version);
 
         return self.removeMarked(version, executable, registration, options) catch |err| {
             // The marker is created before any destructive action. Recreate it
@@ -219,6 +225,15 @@ pub const Store = struct {
         const executable_name = if (builtin.os.tag == .windows) "zig.exe" else "zig";
         const expected_executable = try std.fs.path.join(self.allocator, &.{ toolchain_path, executable_name });
         if (!pathEqual(executable, expected_executable)) return null;
+        // Never traverse a toolchains junction into a different installation.
+        const parent = try std.fs.path.join(self.allocator, &.{ self.root, "toolchains" });
+        for ([_][]const u8{ parent, toolchain_path }) |path| {
+            const stat = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            if (stat.kind != .directory) return error.UnsafeToolchainPath;
+        }
         return toolchain_path;
     }
 
@@ -238,6 +253,12 @@ pub const Store = struct {
                     options.force,
                 );
                 result.terminated_processes += process_result.terminated;
+                result.terminated_processes += try @import("locks_windows.zig").ensureUnlocked(
+                    self.allocator,
+                    self.io,
+                    toolchain_path,
+                    options.force,
+                );
             }
             self.deleteManagedToolchain(toolchain_path, executable) catch |err| switch (err) {
                 // A new process can start between inspection and unlink. Force
@@ -288,6 +309,19 @@ pub const Store = struct {
             .truncate = false,
             .lock = .exclusive,
         });
+    }
+
+    fn acquireRemovalLock(self: Store, name: []const u8) !Io.File {
+        const path = try std.fs.path.join(self.allocator, &.{ self.root, name });
+        return Io.Dir.cwd().createFile(self.io, path, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => error.RemovalAlreadyRunning,
+            else => err,
+        };
     }
 
     pub fn registrationPath(self: Store, version: []const u8) ![]const u8 {

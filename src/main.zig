@@ -96,9 +96,10 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "remove")) {
         const remove_args = parseRemoveArgs(args) catch return fail(stdout, stderr, error.InvalidArguments);
         const result = store.remove(remove_args.version, .{ .force = remove_args.force }) catch |err| {
-            const incomplete = store.isIncomplete(remove_args.version) catch false;
-            if (incomplete) return failRemoval(stdout, stderr, err);
-            return fail(stdout, stderr, err);
+            switch (err) {
+                error.InvalidVersion, error.VersionNotFound, error.RemovalAlreadyRunning => return fail(stdout, stderr, err),
+                else => return failRemoval(stdout, stderr, err),
+            }
         };
         try stdout.print("removed registration for {s}\n", .{remove_args.version});
         if (result.terminated_processes != 0) {
@@ -134,7 +135,7 @@ fn listVersions(store: Store, writer: *Io.Writer) !void {
         const is_active = (active != null and store_mod.versionEqual(active.?, version)) or
             (active_dev != null and store_mod.versionEqual(active_dev.?, version));
         const marker = if (is_active) "*" else " ";
-        const incomplete = if (try store.isIncomplete(version)) " Incomplete" else "";
+        const incomplete = if (try store.isIncomplete(version)) " [Incomplete]" else "";
         try writer.print("{s} {s}{s}\n", .{ marker, version, incomplete });
     }
     if (versions.items.len == 0) try writer.writeAll("no registered Zig versions\n");
@@ -193,7 +194,7 @@ fn fail(stdout: *Io.Writer, stderr: *Io.Writer, err: anyerror) noreturn {
 
 fn failRemoval(stdout: *Io.Writer, stderr: *Io.Writer, err: anyerror) noreturn {
     stdout.flush() catch {};
-    stderr.writeAll("zigup: version was not removed Incomplete\n") catch {};
+    stderr.writeAll("zigup: removal did not complete [Incomplete]; files may be partially removed\n") catch {};
     stderr.print("reason: {s}\n", .{describeError(err)}) catch {};
     stderr.print("details: {s}\n", .{@errorName(err)}) catch {};
     stderr.flush() catch {};
@@ -205,9 +206,12 @@ fn describeError(err: anyerror) []const u8 {
         error.InvalidArguments => "invalid command arguments; run `zigup help`",
         error.InvalidVersion => "invalid version name",
         error.VersionNotFound => "version is not registered",
+        error.RemovalAlreadyRunning => "another update or store operation is running; nothing was deleted",
         error.ToolchainInUse => "toolchain is in use; stop running Zig processes and retry",
         error.ToolchainForceStopFailed => "could not stop every process using the toolchain",
         error.ToolchainProcessInspectionFailed => "could not inspect running processes for toolchain locks",
+        error.ToolchainLockInspectionFailed => "could not inspect toolchain file locks; deletion aborted",
+        error.UnsafeToolchainPath => "managed toolchain path contains a link or unexpected entry; deletion aborted",
         error.InvalidRegistration => "registration metadata is invalid",
         error.NotAFile => "the Zig executable path is not a file",
         error.NotExecutable => "the Zig executable path is not executable",
@@ -263,7 +267,7 @@ fn printUsage(writer: *Io.Writer) !void {
         \\  zigup version
         \\
         \\`remove` checks for running toolchain processes before deletion. Failures
-        \\are retained as Incomplete; `remove -force` stops those processes first.
+        \\are retained as [Incomplete]; `remove -force` stops those processes first.
         \\Managed toolchains are deleted; external installations are unregistered.
         \\Downloads automatically select environment/system proxies, then direct.
         \\ZIGUP_PROXY=direct disables proxies; ZIGUP_PROXY=<URL> forces one proxy.

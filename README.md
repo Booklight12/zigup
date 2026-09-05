@@ -64,12 +64,16 @@ that entry manually; zigup will not move or replace a shared directory.
 - `zigup use <version>` selects a version and regenerates the shim.
 - `zigup current` displays the selected version and executable.
 - `zigup where <version>` displays a registered executable path.
-- `zigup remove <version>` first checks whether the selected toolchain has
-  running processes. An in-use toolchain is left untouched and the version is
-  shown by `zigup list` with `Incompelte`. Other removal failures retain the same
-  marker and registration for a later retry. `zigup remove -force <version>`
-  terminates only processes running that exact toolchain executable and their
-  descendants before retrying deletion. Managed toolchains under the zigup
+- `zigup remove <version>` checks update/store locks without waiting. On Windows
+  it then checks running toolchain processes and delete access to every entry
+  before deleting files. An in-use toolchain is left untouched and the version
+  is shown by `zigup list` with `[Incomplete]`. Removal failures return
+  a nonzero exit code and retain the registration and marker for retry; files
+  already deleted are not rolled back. `zigup remove -force <version>` stops
+  processes running that exact executable and their descendants, and releases
+  other file locks using Windows Restart Manager. Process creation times are
+  checked before termination to avoid recycled PIDs. Force cannot bypass OS
+  permissions, critical processes, or an ongoing zigup operation. Managed toolchains under the zigup
   data directory are deleted; externally managed installations are only
   unregistered. Removing an active version also clears its channel selection
   and command shim after its managed files have been deleted successfully.
